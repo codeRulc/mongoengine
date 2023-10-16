@@ -717,7 +717,7 @@ class BaseQuerySet:
             if result["value"] is not None:
                 result["value"] = self._document._from_son(result["value"])
         else:
-            if result is not None and not queryset._as_pymongo::
+            if result is not None and not queryset._as_pymongo:
                 result = self._document._from_son(result)
 
         return result
