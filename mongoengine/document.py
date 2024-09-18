@@ -15,7 +15,11 @@ from mongoengine.base import (
     get_document,
 )
 from mongoengine.common import _import_class
-from mongoengine.connection import DEFAULT_CONNECTION_NAME, get_db
+from mongoengine.connection import (
+    DEFAULT_CONNECTION_NAME,
+    _get_session,
+    get_db,
+)
 from mongoengine.context_managers import (
     set_write_concern,
     switch_collection,
@@ -220,6 +224,8 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
             # Get the collection, either capped or regular.
             if cls._meta.get("max_size") or cls._meta.get("max_documents"):
                 cls._collection = cls._get_capped_collection()
+            elif cls._meta.get("timeseries"):
+                cls._collection = cls._get_timeseries_collection()
             else:
                 db = cls._get_db()
                 collection_name = cls._get_collection_name()
@@ -269,7 +275,28 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         if max_documents:
             opts["max"] = max_documents
 
-        return db.create_collection(collection_name, **opts)
+        return db.create_collection(collection_name, session=_get_session(), **opts)
+
+    @classmethod
+    def _get_timeseries_collection(cls):
+        """Create a new or get an existing timeseries PyMongo collection."""
+        db = cls._get_db()
+        collection_name = cls._get_collection_name()
+        timeseries_opts = cls._meta.get("timeseries")
+
+        if collection_name in list_collection_names(
+            db, include_system_collections=True
+        ):
+            collection = db[collection_name]
+            collection.options()
+            return collection
+
+        opts = {"expireAfterSeconds": timeseries_opts.pop("expireAfterSeconds", None)}
+        return db.create_collection(
+            name=collection_name,
+            timeseries=timeseries_opts,
+            **opts,
+        )
 
     def to_mongo(self, *args, **kwargs):
         data = super().to_mongo(*args, **kwargs)
@@ -479,17 +506,21 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         collection = self._get_collection()
         with set_write_concern(collection, write_concern) as wc_collection:
             if force_insert:
-                return wc_collection.insert_one(doc).inserted_id
+                return wc_collection.insert_one(doc, session=_get_session()).inserted_id
             # insert_one will provoke UniqueError alongside save does not
             # therefore, it need to catch and call replace_one.
             if "_id" in doc:
                 select_dict = {"_id": doc["_id"]}
                 select_dict = self._integrate_shard_key(doc, select_dict)
-                raw_object = wc_collection.find_one_and_replace(select_dict, doc)
+                raw_object = wc_collection.find_one_and_replace(
+                    select_dict, doc, session=_get_session()
+                )
                 if raw_object:
                     return doc["_id"]
 
-            object_id = wc_collection.insert_one(doc).inserted_id
+            object_id = wc_collection.insert_one(
+                doc, session=_get_session()
+            ).inserted_id
 
         return object_id
 
@@ -547,7 +578,7 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
             upsert = save_condition is None
             with set_write_concern(collection, write_concern) as wc_collection:
                 last_error = wc_collection.update_one(
-                    select_dict, update_doc, upsert=upsert
+                    select_dict, update_doc, upsert=upsert, session=_get_session()
                 ).raw_result
             if not upsert and last_error["n"] == 0:
                 raise SaveConditionError(
@@ -850,7 +881,7 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
             )
         cls._collection = None
         db = cls._get_db()
-        db.drop_collection(coll_name)
+        db.drop_collection(coll_name, session=_get_session())
 
     @classmethod
     def create_index(cls, keys, background=False, **kwargs):
@@ -867,7 +898,9 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         index_spec["background"] = background
         index_spec.update(kwargs)
 
-        return cls._get_collection().create_index(fields, **index_spec)
+        return cls._get_collection().create_index(
+            fields, session=_get_session(), **index_spec
+        )
 
     @classmethod
     def ensure_indexes(cls):
@@ -913,7 +946,9 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
                 if "cls" in opts:
                     del opts["cls"]
 
-                collection.create_index(fields, background=background, **opts)
+                collection.create_index(
+                    fields, background=background, session=_get_session(), **opts
+                )
 
         # If _cls is being used (for polymorphism), it needs an index,
         # only if another index doesn't begin with _cls
@@ -923,7 +958,9 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
             if "cls" in index_opts:
                 del index_opts["cls"]
 
-            collection.create_index("_cls", background=background, **index_opts)
+            collection.create_index(
+                "_cls", background=background, session=_get_session(), **index_opts
+            )
 
     @classmethod
     def list_indexes(cls):
@@ -1001,7 +1038,7 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
 
         existing = []
         collection = cls._get_collection()
-        for info in collection.index_information().values():
+        for info in collection.index_information(session=_get_session()).values():
             if "_fts" in info["key"][0]:
                 # Useful for text indexes (but not only)
                 index_type = info["key"][0][1]

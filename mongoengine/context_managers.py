@@ -1,11 +1,22 @@
+import contextlib
+import logging
 import threading
 from contextlib import contextmanager
 
+from pymongo.errors import ConnectionFailure, OperationFailure
 from pymongo.read_concern import ReadConcern
 from pymongo.write_concern import WriteConcern
 
+from mongoengine.base.fields import _no_dereference_for_fields
 from mongoengine.common import _import_class
-from mongoengine.connection import DEFAULT_CONNECTION_NAME, get_db
+from mongoengine.connection import (
+    DEFAULT_CONNECTION_NAME,
+    _clear_session,
+    _get_session,
+    _set_session,
+    get_connection,
+    get_db,
+)
 from mongoengine.pymongo_support import count_documents
 
 __all__ = (
@@ -17,11 +28,13 @@ __all__ = (
     "set_write_concern",
     "set_read_write_concern",
     "no_dereferencing_active_for_class",
+    "run_in_transaction",
 )
 
 
 class MyThreadLocals(threading.local):
     def __init__(self):
+        # {DocCls: count} keeping track of classes with an active no_dereference context
         self.no_dereferencing_class = {}
 
 
@@ -126,46 +139,37 @@ class switch_collection:
         self.cls._get_collection_name = self.ori_get_collection_name
 
 
-class no_dereference:
+@contextlib.contextmanager
+def no_dereference(cls):
     """no_dereference context manager.
 
     Turns off all dereferencing in Documents for the duration of the context
     manager::
 
         with no_dereference(Group):
-            Group.objects.find()
+            Group.objects()
     """
-
-    def __init__(self, cls):
-        """Construct the no_dereference context manager.
-
-        :param cls: the class to turn dereferencing off on
-        """
-        self.cls = cls
+    try:
+        cls = cls
 
         ReferenceField = _import_class("ReferenceField")
         GenericReferenceField = _import_class("GenericReferenceField")
         ComplexBaseField = _import_class("ComplexBaseField")
 
-        self.deref_fields = [
-            k
-            for k, v in self.cls._fields.items()
-            if isinstance(v, (ReferenceField, GenericReferenceField, ComplexBaseField))
+        deref_fields = [
+            field
+            for name, field in cls._fields.items()
+            if isinstance(
+                field, (ReferenceField, GenericReferenceField, ComplexBaseField)
+            )
         ]
 
-    def __enter__(self):
-        """Change the objects default and _auto_dereference values."""
-        _register_no_dereferencing_for_class(self.cls)
+        _register_no_dereferencing_for_class(cls)
 
-        for field in self.deref_fields:
-            self.cls._fields[field]._auto_dereference = False
-
-    def __exit__(self, t, value, traceback):
-        """Reset the default and _auto_dereference values."""
-        _unregister_no_dereferencing_for_class(self.cls)
-
-        for field in self.deref_fields:
-            self.cls._fields[field]._auto_dereference = True
+        with _no_dereference_for_fields(*deref_fields):
+            yield None
+    finally:
+        _unregister_no_dereferencing_for_class(cls)
 
 
 class no_sub_classes:
@@ -180,7 +184,7 @@ class no_sub_classes:
     def __init__(self, cls):
         """Construct the no_sub_classes context manager.
 
-        :param cls: the class to turn querying sub classes on
+        :param cls: the class to turn querying subclasses on
         """
         self.cls = cls
         self.cls_initial_subclasses = None
@@ -221,7 +225,7 @@ class query_counter:
 
     Be aware that:
 
-    - Iterating over large amount of documents (>101) makes pymongo issue `getmore` queries to fetch the next batch of documents (https://docs.mongodb.com/manual/tutorial/iterate-a-cursor/#cursor-batches)
+    - Iterating over large amount of documents (>101) makes pymongo issue `getmore` queries to fetch the next batch of documents (https://www.mongodb.com/docs/manual/tutorial/iterate-a-cursor/#cursor-batches)
     - Some queries are ignored by default by the counter (killcursors, db.system.indexes)
     """
 
@@ -237,11 +241,11 @@ class query_counter:
         }
 
     def _turn_on_profiling(self):
-        profile_update_res = self.db.command({"profile": 0})
+        profile_update_res = self.db.command({"profile": 0}, session=_get_session())
         self.initial_profiling_level = profile_update_res["was"]
 
         self.db.system.profile.drop()
-        self.db.command({"profile": 2})
+        self.db.command({"profile": 2}, session=_get_session())
 
     def _resets_profiling(self):
         self.db.command({"profile": self.initial_profiling_level})
@@ -317,3 +321,60 @@ def set_read_write_concern(collection, write_concerns, read_concerns):
         write_concern=WriteConcern(**combined_write_concerns),
         read_concern=ReadConcern(**combined_read_concerns),
     )
+
+
+def _commit_with_retry(session):
+    while True:
+        try:
+            # Commit uses write concern set at transaction start.
+            session.commit_transaction()
+            break
+        except (ConnectionFailure, OperationFailure) as exc:
+            # Can retry commit
+            if exc.has_error_label("UnknownTransactionCommitResult"):
+                logging.warning(
+                    "UnknownTransactionCommitResult, retrying commit operation ..."
+                )
+                continue
+            else:
+                # Error during commit
+                raise
+
+
+@contextmanager
+def run_in_transaction(
+    alias=DEFAULT_CONNECTION_NAME, session_kwargs=None, transaction_kwargs=None
+):
+    """run_in_transaction context manager
+    Execute queries within the context in a database transaction.
+
+    Usage:
+
+    .. code-block:: python
+
+        class A(Document):
+            name = StringField()
+
+        with run_in_transaction():
+            a_doc = A.objects.create(name="a")
+            a_doc.update(name="b")
+
+    Be aware that:
+    - Mongo transactions run inside a session which is bound to a connection. If you attempt to
+      execute a transaction across a different connection alias, pymongo will raise an exception. In
+      other words: you cannot create a transaction that crosses different database connections. That
+      said, multiple transaction can be nested within the same session for particular connection.
+
+    For more information regarding pymongo transactions: https://pymongo.readthedocs.io/en/stable/api/pymongo/client_session.html#transactions
+    """
+    conn = get_connection(alias)
+    session_kwargs = session_kwargs or {}
+    with conn.start_session(**session_kwargs) as session:
+        transaction_kwargs = transaction_kwargs or {}
+        with session.start_transaction(**transaction_kwargs):
+            try:
+                _set_session(session)
+                yield
+                _commit_with_retry(session)
+            finally:
+                _clear_session()

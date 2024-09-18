@@ -7,7 +7,26 @@ Changelog
 Development
 ===========
 - (Fill this out as you fix issues and develop your features).
+- Add support for transaction through run_in_transaction (kudos to juannyG for this) #2569
+  Some considerations:
+    - make sure to read https://www.mongodb.com/docs/manual/core/transactions-in-applications/#callback-api-vs-core-api
+    - run_in_transaction context manager relies on Pymongo coreAPI, it will retry automatically in case of `UnknownTransactionCommitResult` but not `TransientTransactionError` exceptions
+    - Using .count() in a transaction will always use Collection.count_document (as estimated_document_count is not supported in transactions)
+
+Changes in 0.29.0
+=================
+- Fix weakref in EmbeddedDocumentListField (causing brief mem leak in certain circumstances) #2827
+- Fix pillow deprecation warning related with LANCZOS filter #2824
+- Allow gt/gte/lt/lte/ne operators to be used with a list as value on ListField #2813
 - Switch tox to use pytest instead of legacy `python setup.py test` #2804
+- Add support for timeseries collection #2661
+- Add support in tests for MongoDB 7.0, pymongo 4.7 and pymongo 4.8 in the CI #2826
+- Add support for `array_filters` in Queryset.modify #2811
+- Integrate a docker-compose setup for local testing #2555
+- improve ReferenceField wrong usage detection
+- Fix no_dereference thread-safetyness #2830
+- BREAKING CHANGE: max_length in ListField is now keyword only on ListField signature
+- BREAKING CHANGE: Force `field` argument of ListField/DictField to be a field instance (e.g ListField(StringField()) instead of ListField(StringField)
 
 Changes in 0.28.2
 =================

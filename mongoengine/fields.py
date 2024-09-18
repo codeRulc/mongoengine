@@ -6,6 +6,7 @@ import re
 import socket
 import time
 import uuid
+from inspect import isclass
 from io import BytesIO
 from operator import itemgetter
 
@@ -34,7 +35,11 @@ from mongoengine.base import (
 )
 from mongoengine.base.utils import LazyRegexCompiler
 from mongoengine.common import _import_class
-from mongoengine.connection import DEFAULT_CONNECTION_NAME, get_db
+from mongoengine.connection import (
+    DEFAULT_CONNECTION_NAME,
+    _get_session,
+    get_db,
+)
 from mongoengine.document import Document, EmbeddedDocument
 from mongoengine.errors import (
     DoesNotExist,
@@ -48,8 +53,12 @@ from mongoengine.queryset.transform import STRING_OPERATORS
 try:
     from PIL import Image, ImageOps
 
-    LANCZOS = Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.ANTIALIAS
+    if hasattr(Image, "Resampling"):
+        LANCZOS = Image.Resampling.LANCZOS
+    else:
+        LANCZOS = Image.LANCZOS
 except ImportError:
+    # pillow is optional so may not be installed
     Image = None
     ImageOps = None
 
@@ -707,7 +716,6 @@ class EmbeddedDocumentField(BaseField):
     """
 
     def __init__(self, document_type, **kwargs):
-        # XXX ValidationError raised outside of the "validate" method.
         if not (
             isinstance(document_type, str)
             or issubclass(document_type, EmbeddedDocument)
@@ -882,7 +890,9 @@ class DynamicField(BaseField):
         if isinstance(value, dict) and "_cls" in value:
             doc_cls = get_document(value["_cls"])
             if "_ref" in value:
-                value = doc_cls._get_db().dereference(value["_ref"])
+                value = doc_cls._get_db().dereference(
+                    value["_ref"], session=_get_session()
+                )
             return doc_cls._from_son(value)
 
         return super().to_python(value)
@@ -910,9 +920,9 @@ class ListField(ComplexBaseField):
         Required means it cannot be empty - as the default for ListFields is []
     """
 
-    def __init__(self, field=None, max_length=None, **kwargs):
+    def __init__(self, field=None, *, max_length=None, **kwargs):
         self.max_length = max_length
-        kwargs.setdefault("default", lambda: [])
+        kwargs.setdefault("default", list)
         super().__init__(field=field, **kwargs)
 
     def __get__(self, instance, owner):
@@ -951,11 +961,11 @@ class ListField(ComplexBaseField):
         if self.field:
             # If the value is iterable and it's not a string nor a
             # BaseDocument, call prepare_query_value for each of its items.
+            is_iter = hasattr(value, "__iter__")
+            eligible_iter = is_iter and not isinstance(value, (str, BaseDocument))
             if (
-                op in ("set", "unset", None)
-                and hasattr(value, "__iter__")
-                and not isinstance(value, str)
-                and not isinstance(value, BaseDocument)
+                op in ("set", "unset", "gt", "gte", "lt", "lte", "ne", None)
+                and eligible_iter
             ):
                 return [self.field.prepare_query_value(op, v) for v in value]
 
@@ -1035,10 +1045,9 @@ class DictField(ComplexBaseField):
     """
 
     def __init__(self, field=None, *args, **kwargs):
-        self._auto_dereference = False
-
-        kwargs.setdefault("default", lambda: {})
+        kwargs.setdefault("default", dict)
         super().__init__(*args, field=field, **kwargs)
+        self.set_auto_dereferencing(False)
 
     def validate(self, value):
         """Make sure that a list of valid fields is being used."""
@@ -1151,8 +1160,9 @@ class ReferenceField(BaseField):
             :class:`~pymongo.dbref.DBRef`, regardless of the value of `dbref`.
         """
         # XXX ValidationError raised outside of the "validate" method.
-        if not isinstance(document_type, str) and not issubclass(
-            document_type, Document
+        if not (
+            isinstance(document_type, str)
+            or (isclass(document_type) and issubclass(document_type, Document))
         ):
             self.error(
                 "Argument to ReferenceField constructor must be a "
@@ -1175,7 +1185,7 @@ class ReferenceField(BaseField):
 
     @staticmethod
     def _lazy_load_ref(ref_cls, dbref):
-        dereferenced_son = ref_cls._get_db().dereference(dbref)
+        dereferenced_son = ref_cls._get_db().dereference(dbref, session=_get_session())
         if dereferenced_son is None:
             raise DoesNotExist(f"Trying to dereference unknown document {dbref}")
 
@@ -1323,7 +1333,7 @@ class CachedReferenceField(BaseField):
             collection = self.document_type._get_collection_name()
             value = DBRef(collection, self.document_type.id.to_python(value["_id"]))
             return self.document_type._from_son(
-                self.document_type._get_db().dereference(value)
+                self.document_type._get_db().dereference(value, session=_get_session())
             )
 
         return value
@@ -1339,7 +1349,7 @@ class CachedReferenceField(BaseField):
 
     @staticmethod
     def _lazy_load_ref(ref_cls, dbref):
-        dereferenced_son = ref_cls._get_db().dereference(dbref)
+        dereferenced_son = ref_cls._get_db().dereference(dbref, session=_get_session())
         if dereferenced_son is None:
             raise DoesNotExist(f"Trying to dereference unknown document {dbref}")
 
@@ -1483,7 +1493,7 @@ class GenericReferenceField(BaseField):
 
     @staticmethod
     def _lazy_load_ref(ref_cls, dbref):
-        dereferenced_son = ref_cls._get_db().dereference(dbref)
+        dereferenced_son = ref_cls._get_db().dereference(dbref, session=_get_session())
         if dereferenced_son is None:
             raise DoesNotExist(f"Trying to dereference unknown document {dbref}")
 
@@ -1760,7 +1770,7 @@ class GridFSProxy:
 
         try:
             if self.gridout is None:
-                self.gridout = self.fs.get(self.grid_id)
+                self.gridout = self.fs.get(self.grid_id, session=_get_session())
             return self.gridout
         except Exception:
             # File has been deleted
@@ -1809,7 +1819,7 @@ class GridFSProxy:
 
     def delete(self):
         # Delete file from GridFS, FileField still remains
-        self.fs.delete(self.grid_id)
+        self.fs.delete(self.grid_id, session=_get_session())
         self.grid_id = None
         self.gridout = None
         self._mark_as_changed()
@@ -1981,7 +1991,7 @@ class ImageGridFsProxy(GridFSProxy):
         # deletes thumbnail
         out = self.get()
         if out and out.thumbnail_id:
-            self.fs.delete(out.thumbnail_id)
+            self.fs.delete(out.thumbnail_id, session=_get_session())
 
         return super().delete()
 
@@ -2021,7 +2031,7 @@ class ImageGridFsProxy(GridFSProxy):
         """
         out = self.get()
         if out and out.thumbnail_id:
-            return self.fs.get(out.thumbnail_id)
+            return self.fs.get(out.thumbnail_id, session=_get_session())
 
     def write(self, *args, **kwargs):
         raise RuntimeError('Please use "put" method instead')
@@ -2065,7 +2075,7 @@ class ImageField(FileField):
 
 class SequenceField(BaseField):
     """Provides a sequential counter see:
-     https://docs.mongodb.com/manual/reference/method/ObjectId/#ObjectIDs-SequenceNumbers
+     https://www.mongodb.com/docs/manual/reference/method/ObjectId/#ObjectIDs-SequenceNumbers
 
     .. note::
 
@@ -2124,6 +2134,7 @@ class SequenceField(BaseField):
             update={"$inc": {"next": 1}},
             return_document=ReturnDocument.AFTER,
             upsert=True,
+            session=_get_session(),
         )
         return self.value_decorator(counter["next"])
 
@@ -2137,6 +2148,7 @@ class SequenceField(BaseField):
             update={"$set": {"next": value}},
             return_document=ReturnDocument.AFTER,
             upsert=True,
+            session=_get_session(),
         )
         return self.value_decorator(counter["next"])
 
@@ -2149,7 +2161,7 @@ class SequenceField(BaseField):
         sequence_name = self.get_sequence_name()
         sequence_id = f"{sequence_name}.{self.name}"
         collection = get_db(alias=self.db_alias)[self.collection_name]
-        data = collection.find_one({"_id": sequence_id})
+        data = collection.find_one({"_id": sequence_id}, session=_get_session())
 
         if data:
             return self.value_decorator(data["next"] + 1)
