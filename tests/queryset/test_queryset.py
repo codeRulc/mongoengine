@@ -27,19 +27,12 @@ from mongoengine.queryset import (
 )
 from mongoengine.queryset.base import BaseQuerySet
 from tests.utils import (
+    db_ops_tracker,
+    get_as_pymongo,
     requires_mongodb_gte_42,
     requires_mongodb_gte_44,
     requires_mongodb_lt_42,
 )
-
-
-class db_ops_tracker(query_counter):
-    def get_ops(self):
-        ignore_query = dict(self._ignored_query)
-        ignore_query["command.count"] = {
-            "$ne": "system.profile"
-        }  # Ignore the query issued by query_counter
-        return list(self.db.system.profile.find(ignore_query))
 
 
 def get_key_compat(mongo_ver):
@@ -474,8 +467,7 @@ class TestQueryset(unittest.TestCase):
 
         A.drop_collection()
 
-        for i in range(100):
-            A.objects.create(s=str(i))
+        A.objects.insert([A(s=str(i)) for i in range(100)], load_bulk=True)
 
         # test iterating over the result set
         cnt = 0
@@ -1283,8 +1275,7 @@ class TestQueryset(unittest.TestCase):
 
         Doc.drop_collection()
 
-        for i in range(1000):
-            Doc(number=i).save()
+        Doc.objects.insert([Doc(number=i) for i in range(1000)], load_bulk=True)
 
         docs = Doc.objects.order_by("number")
 
@@ -4466,7 +4457,7 @@ class TestQueryset(unittest.TestCase):
         ]
         assert ([("_cls", 1), ("message", 1)], False, False) in info
 
-    def test_where(self):
+    def test_where_query(self):
         """Ensure that where clauses work."""
 
         class IntPair(Document):
@@ -4508,6 +4499,60 @@ class TestQueryset(unittest.TestCase):
 
         with pytest.raises(TypeError):
             list(IntPair.objects.where(fielda__gte=3))
+
+    def test_where_query_field_name_subs(self):
+        class DomainObj(Document):
+            field_1 = StringField(db_field="field_2")
+
+        DomainObj.drop_collection()
+
+        DomainObj(field_1="test").save()
+
+        obj = DomainObj.objects.where("this[~field_1] == 'NOTMATCHING'")
+        assert not list(obj)
+
+        obj = DomainObj.objects.where("this[~field_1] == 'test'")
+        assert list(obj)
+
+    def test_where_modify(self):
+        class DomainObj(Document):
+            field = StringField()
+
+        DomainObj.drop_collection()
+
+        DomainObj(field="test").save()
+
+        obj = DomainObj.objects.where("this[~field] == 'NOTMATCHING'")
+        assert not list(obj)
+
+        obj = DomainObj.objects.where("this[~field] == 'test'")
+        assert list(obj)
+
+        qs = DomainObj.objects.where("this[~field] == 'NOTMATCHING'").modify(
+            field="new"
+        )
+        assert not qs
+
+        qs = DomainObj.objects.where("this[~field] == 'test'").modify(field="new")
+        assert qs
+
+    def test_where_modify_field_name_subs(self):
+        class DomainObj(Document):
+            field_1 = StringField(db_field="field_2")
+
+        DomainObj.drop_collection()
+
+        DomainObj(field_1="test").save()
+
+        obj = DomainObj.objects.where("this[~field_1] == 'NOTMATCHING'").modify(
+            field_1="new"
+        )
+        assert not obj
+
+        obj = DomainObj.objects.where("this[~field_1] == 'test'").modify(field_1="new")
+        assert obj
+
+        assert get_as_pymongo(obj) == {"_id": obj.id, "field_2": "new"}
 
     def test_scalar(self):
         class Organization(Document):
@@ -5438,8 +5483,9 @@ class TestQueryset(unittest.TestCase):
             name = StringField()
 
         Person.drop_collection()
-        for i in range(100):
-            Person(name="No: %s" % i).save()
+
+        persons = [Person(name="No: %s" % i) for i in range(100)]
+        Person.objects.insert(persons, load_bulk=True)
 
         with query_counter() as q:
             assert q == 0
@@ -5469,8 +5515,9 @@ class TestQueryset(unittest.TestCase):
             name = StringField()
 
         Person.drop_collection()
-        for i in range(100):
-            Person(name="No: %s" % i).save()
+
+        persons = [Person(name="No: %s" % i) for i in range(100)]
+        Person.objects.insert(persons, load_bulk=True)
 
         with query_counter() as q:
             assert q == 0
@@ -5537,17 +5584,20 @@ class TestQueryset(unittest.TestCase):
         assert 1 == len(users._result_cache)
 
     def test_no_cache(self):
-        """Ensure you can add meta data to file"""
+        """Ensure you can add metadata to file"""
 
         class Noddy(Document):
             fields = DictField()
 
         Noddy.drop_collection()
+
+        noddies = []
         for i in range(100):
             noddy = Noddy()
             for j in range(20):
                 noddy.fields["key" + str(j)] = "value " + str(j)
-            noddy.save()
+            noddies.append(noddy)
+        Noddy.objects.insert(noddies, load_bulk=True)
 
         docs = Noddy.objects.no_cache()
 
@@ -5766,8 +5816,9 @@ class TestQueryset(unittest.TestCase):
             name = StringField()
 
         Person.drop_collection()
-        for i in range(100):
-            Person(name="No: %s" % i).save()
+
+        persons = [Person(name="No: %s" % i) for i in range(100)]
+        Person.objects.insert(persons, load_bulk=True)
 
         with query_counter() as q:
             if Person.objects:

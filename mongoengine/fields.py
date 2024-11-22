@@ -14,7 +14,6 @@ import gridfs
 import pymongo
 from bson import SON, Binary, DBRef, ObjectId
 from bson.decimal128 import Decimal128, create_decimal128_context
-from bson.int64 import Int64
 from pymongo import ReturnDocument
 
 try:
@@ -31,7 +30,7 @@ from mongoengine.base import (
     GeoJsonBaseField,
     LazyReference,
     ObjectIdField,
-    get_document,
+    _DocumentRegistry,
 )
 from mongoengine.base.utils import LazyRegexCompiler
 from mongoengine.common import _import_class
@@ -68,7 +67,6 @@ __all__ = (
     "URLField",
     "EmailField",
     "IntField",
-    "LongField",
     "FloatField",
     "DecimalField",
     "BooleanField",
@@ -111,6 +109,14 @@ __all__ = (
 )
 
 RECURSIVE_REFERENCE_CONSTANT = "self"
+
+
+def _unsaved_object_error(document):
+    return (
+        f"The instance of the document '{document}' you are "
+        "trying to reference has an empty 'id'. You can only reference "
+        "documents once they have been saved to the database"
+    )
 
 
 class StringField(BaseField):
@@ -365,13 +371,6 @@ class IntField(BaseField):
             return value
 
         return super().prepare_query_value(op, int(value))
-
-
-class LongField(IntField):
-    """64-bit integer field. (Equivalent to IntField since the support to Python2 was dropped)"""
-
-    def to_mongo(self, value):
-        return Int64(value)
 
 
 class FloatField(BaseField):
@@ -734,7 +733,7 @@ class EmbeddedDocumentField(BaseField):
             if self.document_type_obj == RECURSIVE_REFERENCE_CONSTANT:
                 resolved_document_type = self.owner_document
             else:
-                resolved_document_type = get_document(self.document_type_obj)
+                resolved_document_type = _DocumentRegistry.get(self.document_type_obj)
 
             if not issubclass(resolved_document_type, EmbeddedDocument):
                 # Due to the late resolution of the document_type
@@ -810,7 +809,7 @@ class GenericEmbeddedDocumentField(BaseField):
 
     def to_python(self, value):
         if isinstance(value, dict):
-            doc_cls = get_document(value["_cls"])
+            doc_cls = _DocumentRegistry.get(value["_cls"])
             value = doc_cls._from_son(value)
 
         return value
@@ -888,7 +887,7 @@ class DynamicField(BaseField):
 
     def to_python(self, value):
         if isinstance(value, dict) and "_cls" in value:
-            doc_cls = get_document(value["_cls"])
+            doc_cls = _DocumentRegistry.get(value["_cls"])
             if "_ref" in value:
                 value = doc_cls._get_db().dereference(
                     value["_ref"], session=_get_session()
@@ -1180,7 +1179,7 @@ class ReferenceField(BaseField):
             if self.document_type_obj == RECURSIVE_REFERENCE_CONSTANT:
                 self.document_type_obj = self.owner_document
             else:
-                self.document_type_obj = get_document(self.document_type_obj)
+                self.document_type_obj = _DocumentRegistry.get(self.document_type_obj)
         return self.document_type_obj
 
     @staticmethod
@@ -1204,7 +1203,7 @@ class ReferenceField(BaseField):
         if auto_dereference and isinstance(ref_value, DBRef):
             if hasattr(ref_value, "cls"):
                 # Dereference using the class type specified in the reference
-                cls = get_document(ref_value.cls)
+                cls = _DocumentRegistry.get(ref_value.cls)
             else:
                 cls = self.document_type
 
@@ -1224,10 +1223,7 @@ class ReferenceField(BaseField):
 
             # XXX ValidationError raised outside of the "validate" method.
             if id_ is None:
-                self.error(
-                    "You can only reference documents once they have"
-                    " been saved to the database"
-                )
+                self.error(_unsaved_object_error(document.__class__.__name__))
 
             # Use the attributes from the document instance, so that they
             # override the attributes of this field's document type
@@ -1271,10 +1267,7 @@ class ReferenceField(BaseField):
             )
 
         if isinstance(value, Document) and value.id is None:
-            self.error(
-                "You can only reference documents once they have been "
-                "saved to the database"
-            )
+            self.error(_unsaved_object_error(value.__class__.__name__))
 
     def lookup_member(self, member_name):
         return self.document_type._fields.get(member_name)
@@ -1344,7 +1337,7 @@ class CachedReferenceField(BaseField):
             if self.document_type_obj == RECURSIVE_REFERENCE_CONSTANT:
                 self.document_type_obj = self.owner_document
             else:
-                self.document_type_obj = get_document(self.document_type_obj)
+                self.document_type_obj = _DocumentRegistry.get(self.document_type_obj)
         return self.document_type_obj
 
     @staticmethod
@@ -1379,10 +1372,7 @@ class CachedReferenceField(BaseField):
             # We need the id from the saved object to create the DBRef
             id_ = document.pk
             if id_ is None:
-                self.error(
-                    "You can only reference documents once they have"
-                    " been saved to the database"
-                )
+                self.error(_unsaved_object_error(document.__class__.__name__))
         else:
             self.error("Only accept a document object")
 
@@ -1403,10 +1393,7 @@ class CachedReferenceField(BaseField):
         # XXX ValidationError raised outside of the "validate" method.
         if isinstance(value, Document):
             if value.pk is None:
-                self.error(
-                    "You can only reference documents once they have"
-                    " been saved to the database"
-                )
+                self.error(_unsaved_object_error(value.__class__.__name__))
             value_dict = {"_id": value.pk}
             for field in self.fields:
                 value_dict.update({field: value[field]})
@@ -1420,10 +1407,7 @@ class CachedReferenceField(BaseField):
             self.error("A CachedReferenceField only accepts documents")
 
         if isinstance(value, Document) and value.id is None:
-            self.error(
-                "You can only reference documents once they have been "
-                "saved to the database"
-            )
+            self.error(_unsaved_object_error(value.__class__.__name__))
 
     def lookup_member(self, member_name):
         return self.document_type._fields.get(member_name)
@@ -1507,7 +1491,7 @@ class GenericReferenceField(BaseField):
 
         auto_dereference = instance._fields[self.name]._auto_dereference
         if auto_dereference and isinstance(value, dict):
-            doc_cls = get_document(value["_cls"])
+            doc_cls = _DocumentRegistry.get(value["_cls"])
             instance._data[self.name] = self._lazy_load_ref(doc_cls, value["_ref"])
 
         return super().__get__(instance, owner)
@@ -1522,10 +1506,7 @@ class GenericReferenceField(BaseField):
 
         # We need the id from the saved object to create the DBRef
         elif isinstance(value, Document) and value.id is None:
-            self.error(
-                "You can only reference documents once they have been"
-                " saved to the database"
-            )
+            self.error(_unsaved_object_error(value.__class__.__name__))
 
     def to_mongo(self, document):
         if document is None:
@@ -1542,10 +1523,7 @@ class GenericReferenceField(BaseField):
             id_ = document.id
             if id_ is None:
                 # XXX ValidationError raised outside of the "validate" method.
-                self.error(
-                    "You can only reference documents once they have"
-                    " been saved to the database"
-                )
+                self.error(_unsaved_object_error(document.__class__.__name__))
         else:
             id_ = document
 
@@ -2452,7 +2430,7 @@ class LazyReferenceField(BaseField):
             if self.document_type_obj == RECURSIVE_REFERENCE_CONSTANT:
                 self.document_type_obj = self.owner_document
             else:
-                self.document_type_obj = get_document(self.document_type_obj)
+                self.document_type_obj = _DocumentRegistry.get(self.document_type_obj)
         return self.document_type_obj
 
     def build_lazyref(self, value):
@@ -2544,10 +2522,7 @@ class LazyReferenceField(BaseField):
                 )
 
         if pk is None:
-            self.error(
-                "You can only reference documents once they have been "
-                "saved to the database"
-            )
+            self.error(_unsaved_object_error(self.document_type.__name__))
 
     def prepare_query_value(self, op, value):
         if value is None:
@@ -2593,7 +2568,7 @@ class GenericLazyReferenceField(GenericReferenceField):
         elif value is not None:
             if isinstance(value, (dict, SON)):
                 value = LazyReference(
-                    get_document(value["_cls"]),
+                    _DocumentRegistry.get(value["_cls"]),
                     value["_ref"].id,
                     passthrough=self.passthrough,
                 )
@@ -2616,8 +2591,9 @@ class GenericLazyReferenceField(GenericReferenceField):
     def validate(self, value):
         if isinstance(value, LazyReference) and value.pk is None:
             self.error(
-                "You can only reference documents once they have been"
-                " saved to the database"
+                _unsaved_object_error(
+                    self.__class__.__name__
+                )  # Actual class is difficult to predict here
             )
         return super().validate(value)
 

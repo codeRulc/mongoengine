@@ -7,7 +7,7 @@ import pymongo
 from bson import SON, DBRef, ObjectId, json_util
 
 from mongoengine import signals
-from mongoengine.base.common import get_document
+from mongoengine.base.common import _DocumentRegistry
 from mongoengine.base.datastructures import (
     BaseDict,
     BaseList,
@@ -455,6 +455,7 @@ class BaseDocument:
                 "representation to use. This will be changed to "
                 "uuid_representation=UNSPECIFIED in a future release.",
                 DeprecationWarning,
+                stacklevel=2,
             )
             kwargs["json_options"] = LEGACY_JSON_OPTIONS
         return json_util.dumps(self.to_mongo(use_db_field), *args, **kwargs)
@@ -486,6 +487,7 @@ class BaseDocument:
                 "representation to use. This will be changed to "
                 "uuid_representation=UNSPECIFIED in a future release.",
                 DeprecationWarning,
+                stacklevel=2,
             )
             kwargs["json_options"] = LEGACY_JSON_OPTIONS
         return cls._from_son(json_util.loads(json_data, **kwargs), created=created)
@@ -498,7 +500,7 @@ class BaseDocument:
         # If the value is a dict with '_cls' in it, turn it into a document
         is_dict = isinstance(value, dict)
         if is_dict and "_cls" in value:
-            cls = get_document(value["_cls"])
+            cls = _DocumentRegistry.get(value["_cls"])
             return cls(**value)
 
         if is_dict:
@@ -800,7 +802,7 @@ class BaseDocument:
 
         # Return correct subclass for document type
         if class_name != cls._class_name:
-            cls = get_document(class_name)
+            cls = _DocumentRegistry.get(class_name)
 
         errors_dict = {}
 

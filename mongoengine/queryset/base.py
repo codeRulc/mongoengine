@@ -13,7 +13,7 @@ from pymongo.common import validate_read_preference
 from pymongo.read_concern import ReadConcern
 
 from mongoengine import signals
-from mongoengine.base import get_document
+from mongoengine.base import _DocumentRegistry
 from mongoengine.common import _import_class
 from mongoengine.connection import _get_session, get_db
 from mongoengine.context_managers import (
@@ -519,8 +519,20 @@ class BaseQuerySet:
                     write_concern=write_concern, **{"pull_all__%s" % field_name: self}
                 )
 
+        kwargs = {}
+        if self._hint not in (-1, None):
+            kwargs["hint"] = self._hint
+        if self._collation:
+            kwargs["collation"] = self._collation
+        if self._comment:
+            kwargs["comment"] = self._comment
+
         with set_write_concern(queryset._collection, write_concern) as collection:
-            result = collection.delete_many(queryset._query, session=_get_session())
+            result = collection.delete_many(
+                queryset._query,
+                session=_get_session(),
+                **kwargs,
+            )
 
             # If we're using an unack'd write concern, we don't really know how
             # many items have been deleted at this point, hence we only return
@@ -582,6 +594,15 @@ class BaseQuerySet:
                 update["$set"]["_cls"] = queryset._document._class_name
             else:
                 update["$set"] = {"_cls": queryset._document._class_name}
+
+        kwargs = {}
+        if self._hint not in (-1, None):
+            kwargs["hint"] = self._hint
+        if self._collation:
+            kwargs["collation"] = self._collation
+        if self._comment:
+            kwargs["comment"] = self._comment
+
         try:
             with set_read_write_concern(
                 queryset._collection, write_concern, read_concern
@@ -595,6 +616,7 @@ class BaseQuerySet:
                     upsert=upsert,
                     array_filters=array_filters,
                     session=_get_session(),
+                    **kwargs,
                 )
             if full_result:
                 return result
@@ -675,7 +697,6 @@ class BaseQuerySet:
     def modify(
         self,
         upsert=False,
-        full_response=False,
         remove=False,
         new=False,
         array_filters=None,
@@ -687,15 +708,7 @@ class BaseQuerySet:
         parameter. If no documents match the query and `upsert` is false,
         returns ``None``. If upserting and `new` is false, returns ``None``.
 
-        If the full_response parameter is ``True``, the return value will be
-        the entire response object from the server, including the 'ok' and
-        'lastErrorObject' fields, rather than just the modified document.
-        This is useful mainly because the 'lastErrorObject' document holds
-        information about the command's execution.
-
         :param upsert: insert if document doesn't exist (default ``False``)
-        :param full_response: return the entire response object from the
-            server (default ``False``, not available for PyMongo 3+)
         :param remove: remove rather than updating (default ``False``)
         :param new: return updated rather than original document
             (default ``False``)
@@ -714,14 +727,16 @@ class BaseQuerySet:
 
         queryset = self.clone()
         query = queryset._query
+
+        if self._where_clause:
+            where_clause = self._sub_js_fields(self._where_clause)
+            query["$where"] = where_clause
+
         if not remove:
             update = transform.update(queryset._document, **update)
         sort = queryset._ordering
 
         try:
-            if full_response:
-                msg = "With PyMongo 3+, it is not possible anymore to get the full response."
-                warnings.warn(msg, DeprecationWarning)
             if remove:
                 result = queryset._collection.find_one_and_delete(
                     query, sort=sort, session=_get_session(), **self._cursor_args
@@ -746,12 +761,8 @@ class BaseQuerySet:
         except pymongo.errors.OperationFailure as err:
             raise OperationError("Update failed (%s)" % err)
 
-        if full_response:
-            if result["value"] is not None:
-                result["value"] = self._document._from_son(result["value"])
-        else:
-            if result is not None and not queryset._as_pymongo:
-                result = self._document._from_son(result)
+        if result is not None and not queryset._as_pymongo:
+            result = self._document._from_son(result)
 
         return result
 
@@ -1222,7 +1233,7 @@ class BaseQuerySet:
         :param enabled: whether or not snapshot mode is enabled
         """
         msg = "snapshot is deprecated as it has no impact when using PyMongo 3+."
-        warnings.warn(msg, DeprecationWarning)
+        warnings.warn(msg, DeprecationWarning, stacklevel=2)
         queryset = self.clone()
         queryset._snapshot = enabled
         return queryset
@@ -1331,6 +1342,7 @@ class BaseQuerySet:
                 "representation to use. This will be changed to "
                 "uuid_representation=UNSPECIFIED in a future release.",
                 DeprecationWarning,
+                stacklevel=2,
             )
             kwargs["json_options"] = LEGACY_JSON_OPTIONS
         return json_util.dumps(self.as_pymongo(), *args, **kwargs)
@@ -1340,24 +1352,26 @@ class BaseQuerySet:
         son_data = json_util.loads(json_data)
         return [self._document._from_son(data) for data in son_data]
 
-    def aggregate(self, pipeline, *suppl_pipeline, **kwargs):
+    def aggregate(self, pipeline, **kwargs):
         """Perform an aggregate function based on your queryset params
+
+        If the queryset contains a query or skip/limit/sort or if the target Document class
+        uses inheritance, this method will add steps prior to the provided pipeline in an arbitrary order.
+        This may affect the performance or outcome of the aggregation, so use it consciously.
+
+        For complex/critical pipelines, we recommended to use the aggregation framework of Pymongo directly,
+        it is available through the collection object (YourDocument._collection.aggregate) and will guarantee
+        that you have full control on the pipeline.
 
         :param pipeline: list of aggregation commands,
             see: https://www.mongodb.com/docs/manual/core/aggregation-pipeline/
-        :param suppl_pipeline: unpacked list of pipeline (added to support deprecation of the old interface)
-            parameter will be removed shortly
         :param kwargs: (optional) kwargs dictionary to be passed to pymongo's aggregate call
             See https://pymongo.readthedocs.io/en/stable/api/pymongo/collection.html#pymongo.collection.Collection.aggregate
         """
-        using_deprecated_interface = isinstance(pipeline, dict) or bool(suppl_pipeline)
-        user_pipeline = [pipeline] if isinstance(pipeline, dict) else list(pipeline)
-
-        if using_deprecated_interface:
-            msg = "Calling .aggregate() with un unpacked list (*pipeline) is deprecated, it will soon change and will expect a list (similar to pymongo.Collection.aggregate interface), see documentation"
-            warnings.warn(msg, DeprecationWarning)
-
-        user_pipeline += suppl_pipeline
+        if not isinstance(pipeline, (tuple, list)):
+            raise TypeError(
+                f"Starting from 1.0 release pipeline must be a list/tuple, received: {type(pipeline)}"
+            )
 
         initial_pipeline = []
         if self._none or self._empty:
@@ -1380,7 +1394,18 @@ class BaseQuerySet:
         if self._skip is not None:
             initial_pipeline.append({"$skip": self._skip})
 
-        final_pipeline = initial_pipeline + user_pipeline
+        # geoNear and collStats must be the first stages in the pipeline if present
+        first_step = []
+        new_user_pipeline = []
+        for step_step in pipeline:
+            if "$geoNear" in step_step:
+                first_step.append(step_step)
+            elif "$collStats" in step_step:
+                first_step.append(step_step)
+            else:
+                new_user_pipeline.append(step_step)
+
+        final_pipeline = first_step + initial_pipeline + new_user_pipeline
 
         collection = self._collection
         if self._read_preference is not None or self._read_concern is not None:
@@ -1388,8 +1413,18 @@ class BaseQuerySet:
                 read_preference=self._read_preference, read_concern=self._read_concern
             )
 
+        if self._hint not in (-1, None):
+            kwargs.setdefault("hint", self._hint)
+        if self._collation:
+            kwargs.setdefault("collation", self._collation)
+        if self._comment:
+            kwargs.setdefault("comment", self._comment)
+
         return collection.aggregate(
-            final_pipeline, cursor={}, session=_get_session(), **kwargs
+            final_pipeline,
+            cursor={},
+            session=_get_session(),
+            **kwargs,
         )
 
     # JS functionality
@@ -1693,7 +1728,7 @@ class BaseQuerySet:
         # TODO: evaluate similar possibilities using modifiers
         if self._snapshot:
             msg = "The snapshot option is not anymore available with PyMongo 3+"
-            warnings.warn(msg, DeprecationWarning)
+            warnings.warn(msg, DeprecationWarning, stacklevel=3)
 
         cursor_args = {}
         if not self._timeout:
@@ -1926,7 +1961,9 @@ class BaseQuerySet:
         """Translate fields' paths to their db equivalents."""
         subclasses = []
         if self._document._meta["allow_inheritance"]:
-            subclasses = [get_document(x) for x in self._document._subclasses][1:]
+            subclasses = [_DocumentRegistry.get(x) for x in self._document._subclasses][
+                1:
+            ]
 
         db_field_paths = []
         for field in fields:

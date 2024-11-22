@@ -1,7 +1,7 @@
 import itertools
 import warnings
 
-from mongoengine.base.common import _document_registry
+from mongoengine.base.common import _DocumentRegistry
 from mongoengine.base.fields import (
     BaseField,
     ComplexBaseField,
@@ -169,7 +169,7 @@ class DocumentMetaclass(type):
             new_class._collection = None
 
         # Add class to the _document_registry
-        _document_registry[new_class._class_name] = new_class
+        _DocumentRegistry.register(new_class)
 
         # Handle delete rules
         for field in new_class._fields.values():
@@ -307,7 +307,7 @@ class TopLevelDocumentMetaclass(DocumentMetaclass):
             and not parent_doc_cls._meta.get("abstract", True)
         ):
             msg = "Trying to set a collection on a subclass (%s)" % name
-            warnings.warn(msg, SyntaxWarning)
+            warnings.warn(msg, SyntaxWarning, stacklevel=2)
             del attrs["_meta"]["collection"]
 
         # Ensure abstract documents have abstract bases
